@@ -3474,6 +3474,8 @@ def debug_template_display_frame(canvas, canvas_image_id, img, x, y, width, heig
 
 
 def load_current_frame_image():
+    if not 0 <= CurrentFrame < len(SourceDirFileList):
+        return None
     # If HDR mode, pick the lightest frame to select rectangle
     file3 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (CurrentFrame + 1, 2, file_type))
     if os.path.isfile(file3):  # If hdr frames exist, add them
@@ -3491,7 +3493,9 @@ def scale_display_update(update_filters=True, offset_x = 0, offset_y = 0):
     global CropTopLeft, CropBottomRight
     global SourceDirFileList
 
-    if CurrentFrame >= len(SourceDirFileList):
+    if not 0 <= CurrentFrame < len(SourceDirFileList):
+        frame_scale_refresh_done = True
+        frame_scale_refresh_pending = False
         return
     img = load_current_frame_image()
     if img is None:
@@ -3542,8 +3546,12 @@ def select_scale_frame(selected_frame):
     global frame_scale_refresh_done, frame_scale_refresh_pending
     global frame_slider
 
-    if int(selected_frame) >= len(SourceDirFileList):
-        selected_frame = str(len(SourceDirFileList) - 1)
+    if not SourceDirFileList:
+        CurrentFrame = 0
+        frame_scale_refresh_done = True
+        frame_scale_refresh_pending = False
+        return
+    selected_frame = max(0, min(int(selected_frame), len(SourceDirFileList) - 1))
     if not ConvertLoopRunning and not BatchJobRunning:  # Do not refresh during conversion loop
         frame_slider.focus()
         CurrentFrame = int(selected_frame)
@@ -4942,6 +4950,7 @@ def get_source_dir_file_list():
     global file_type, file_type_out
     global FrameSync_Images_Factor
     global frame_height, frame_width
+    global FrameInputFilenamePattern
 
     if not os.path.isdir(SourceDir):
         tk.messagebox.showerror("Error!",
@@ -4950,6 +4959,8 @@ def get_source_dir_file_list():
         frames_target_dir.delete(0, 'end')
         return 0
 
+    # Reset on every folder change, including when returning from frame-* input.
+    FrameInputFilenamePattern = "picture-%05d.%s"
     # Try first with standard scan filename template
     SourceDirFileList_jpg = list(glob(os.path.join(
         SourceDir,
@@ -4991,6 +5002,16 @@ def get_source_dir_file_list():
     NumFiles = len(SourceDirFileList)
     NumHdrFiles = len(SourceDirHdrFileList)
     NumLegacyHdrFiles = len(SourceDirLegacyHdrFileList)
+    # Other scanners export ordinary frames with a frame- prefix.
+    if NumFiles == 0 and NumHdrFiles == 0 and NumLegacyHdrFiles == 0:
+        for extension in ('jpg', 'png'):
+            frames = sorted(glob(os.path.join(SourceDir, f"frame-?????.{extension}")))
+            if frames:
+                SourceDirFileList = frames
+                FrameInputFilenamePattern = "frame-%05d.%s"
+                file_type = file_type_out = extension
+                NumFiles = len(frames)
+                break
     if NumFiles != 0 and NumLegacyHdrFiles != 0:
         if tk.messagebox.askyesno(
                 "Frame conflict",
@@ -5573,10 +5594,15 @@ def frame_generation_loop():
     if CurrentFrame >= StartFrame + frames_to_encode and last_displayed_image+1 >= StartFrame + frames_to_encode:
         FPS_CalculatedValue = -1
         # write average match quality in the status line, and in the widget
-        status_str = f"Status: Frame generation OK - AvgQ: {int(match_level_average.get_average()*100)}"
+        average_match = match_level_average.get_average()
+        average_quality = str(int(average_match * 100)) if average_match is not None else 'N/A'
+        status_str = f"Status: Frame generation OK - AvgQ: {average_quality}"
         app_status_label.config(text=status_str, fg='green')
-        stabilization_threshold_match_label.config(fg='white', bg=match_level_color(match_level_average.get_average()),
-                                                   text=str(int(match_level_average.get_average() * 100)))
+        if average_match is not None:
+            stabilization_threshold_match_label.config(fg='white', bg=match_level_color(average_match),
+                                                       text=average_quality)
+        else:
+            stabilization_threshold_match_label.config(fg='black', bg='lightgray', text=average_quality)
         # Clear display queue (does not seem to work as expected, leave commented for now)
         # subprocess_event_queue.queue.clear()
         last_displayed_image = 0
@@ -5586,7 +5612,7 @@ def frame_generation_loop():
             TargetDir, FrameCheckOutputFilenamePattern % file_type_out))))
         if GenerateCsv:
             name, ext = os.path.splitext(CsvPathName)
-            name = f"{name} ({frames_to_encode} frames, {CsvFramesOffPercent:.1f}% KO, Avg match level {int(match_level_average.get_average()*100)}).csv"
+            name = f"{name} ({frames_to_encode} frames, {CsvFramesOffPercent:.1f}% KO, Avg match level {average_quality}).csv"
             os.rename(CsvPathName, name)
         # Stop threads
         terminate_threads(False)

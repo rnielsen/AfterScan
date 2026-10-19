@@ -29,6 +29,29 @@ This tool relies in the following open source projects to achieve its objectives
 * [FFmpeg](https://ffmpeg.org/)
 * [Pillow](https://python-pillow.org/)
 
+## macOS setup (Homebrew)
+
+From the AfterScan project folder, install the system dependencies and create a
+local Python environment:
+
+```sh
+brew install python@3.13 python-tk@3.13 ffmpeg
+"$(brew --prefix python@3.13)/bin/python3.13" -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Start AfterScan from the project folder so it can find its image resources:
+
+```sh
+.venv/bin/python AfterScan.py
+```
+
+The analysis utility uses the same environment:
+
+```sh
+.venv/bin/python AfterScanAnalysis.py
+```
+
 ## How it works:
 Sprocket holes in 8mm films are expected to be in a very precise location for each film type (S8/R8). What this tool does is to detect, thanks to OpenCV, the hole(s) in each frame, and then shift the frame as required so that the holes fall in the expected position. This process is individual for each frame, so the length of the scanned film should have no effect on the result. A couple of points to highlight:
 - Make sure that the input files provided to the tool contain each a full frame, with the sprocket hole(s) 50% visible at least. Otherwise the results will not be good
@@ -46,6 +69,5 @@ Sprocket holes in 8mm films are expected to be in a very precise location for ea
    
 ## Additional information
 You can find a description of the UI elements in the [wiki](https://github.com/jareff-g/AfterScan/wiki/AfterScan-user-interface-description).
-
 
 
