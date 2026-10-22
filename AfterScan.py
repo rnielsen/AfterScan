@@ -44,6 +44,7 @@ from tkinter import Tk, IntVar, StringVar, OptionMenu
 from PIL import ImageTk, Image, ImageDraw, ImageFont
 
 import os
+from frame_paths import frame_path, frame_files, frame_number
 import time
 import subprocess as sp
 import json
@@ -61,6 +62,7 @@ from enum import Enum
 import textwrap
 import random
 import threading
+import tempfile
 import queue
 from matplotlib import font_manager
 from tooltip import Tooltips
@@ -88,6 +90,7 @@ last_absolute_frame = 0
 frame_scale_refresh_done = True
 frame_scale_refresh_pending = False
 frames_to_encode = 0
+video_frame_indices = []  # Source-relative indices included in the current video
 from_frame = 0
 to_frame = 0
 CurrentFrame = 0
@@ -167,6 +170,7 @@ default_project_config = {
     "StabilizationThreshold": 220.0,
     "PerformStabilization": False,
     "skip_frame_regeneration": False,
+    "SkipMisalignedFrames": False,
     "VideoFilename": "",
     "VideoTitle": "",
     "FillBorders": False,
@@ -613,6 +617,8 @@ def set_project_defaults():
     extended_stabilization.set(project_config["ExtendedStabilization"])
     project_config["skip_frame_regeneration"] = False
     skip_frame_regeneration.set(project_config["skip_frame_regeneration"])
+    project_config["SkipMisalignedFrames"] = False
+    skip_misaligned_frames.set(False)
     project_config["VideoFilename"] = ""
     video_filename_str.set(project_config["VideoFilename"])
     project_config["VideoTitle"] = ""
@@ -806,6 +812,7 @@ def save_project_config():
     project_config["TargetDir"] = TargetDir
     project_config["CurrentFrame"] = CurrentFrame
     project_config["skip_frame_regeneration"] = skip_frame_regeneration.get()
+    project_config["SkipMisalignedFrames"] = skip_misaligned_frames.get()
     project_config["FFmpegPreset"] = ffmpeg_preset.get()
     project_config["ProjectConfigDate"] = str(datetime.now())
     project_config["PerformCropping"] = perform_cropping.get()
@@ -1070,6 +1077,7 @@ def decode_project_config():
         generate_video.set(project_config["GenerateVideo"])
     else:
         generate_video.set(False)
+    skip_misaligned_frames.set(project_config.get("SkipMisalignedFrames", False))
     generate_video_selection()
     if 'VideoFilename' in project_config:
         video_filename_str.set(project_config["VideoFilename"])
@@ -1944,6 +1952,7 @@ def widget_status_update(widget_state=0, button_action=0):
         film_type_R8_rb.config(state=DISABLED if template_list.get_active_type() == 'custom' else widget_state)
         generate_video_checkbox.config(state=widget_state if ffmpeg_installed else DISABLED)
         skip_frame_regeneration_cb.config(state=widget_state if project_config["GenerateVideo"] else DISABLED)
+        skip_misaligned_frames_cb.config(state=widget_state if project_config["GenerateVideo"] else DISABLED)
         video_target_dir.config(state=widget_state if project_config["GenerateVideo"] else DISABLED)
         video_target_folder_btn.config(state=widget_state if project_config["GenerateVideo"] else DISABLED)
         video_filename_label.config(state=widget_state if project_config["GenerateVideo"] else DISABLED)
@@ -3477,7 +3486,7 @@ def load_current_frame_image():
     if not 0 <= CurrentFrame < len(SourceDirFileList):
         return None
     # If HDR mode, pick the lightest frame to select rectangle
-    file3 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (CurrentFrame + 1, 2, file_type))
+    file3 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (get_frame_number_from_filename(SourceDirFileList[CurrentFrame]), 2, file_type))
     if os.path.isfile(file3):  # If hdr frames exist, add them
         file = file3
     else:
@@ -3924,7 +3933,7 @@ def select_rectangle_area(is_cropping=False):
 
     file = SourceDirFileList[CurrentFrame]
     # If HDR mode, pick the lightest frame to select rectangle
-    file3 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (CurrentFrame + 1, 2, file_type))
+    file3 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (get_frame_number_from_filename(SourceDirFileList[CurrentFrame]), 2, file_type))
     if os.path.isfile(file3):  # If hdr frames exist, add them
         file = file3
 
@@ -4043,7 +4052,7 @@ def select_custom_template():
         if select_rectangle_area(is_cropping=False) and CurrentFrame < len(SourceDirFileList):
             # Extract template from image
             file = SourceDirFileList[CurrentFrame]
-            file3 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (CurrentFrame + 1, 2, file_type))
+            file3 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (get_frame_number_from_filename(SourceDirFileList[CurrentFrame]), 2, file_type))
             if os.path.isfile(file3):  # If hdr frames exist, add them
                 file = file3
             full_img = cv2.imread(file, cv2.IMREAD_UNCHANGED)
@@ -4429,7 +4438,7 @@ def display_output_frame_by_number(frame_number):
     global StartFrame
     global TargetDirFileList, file_type_out
 
-    TargetFile = TargetDir + '/' + FrameOutputFilenamePattern % (StartFrame + frame_number, file_type_out)
+    TargetFile = frame_path(TargetDir, FrameOutputFilenamePattern % (StartFrame + frame_number, file_type_out))
 
     if TargetFile in TargetDirFileList:
         img = cv2.imread(TargetFile, cv2.IMREAD_UNCHANGED)
@@ -4962,38 +4971,26 @@ def get_source_dir_file_list():
     # Reset on every folder change, including when returning from frame-* input.
     FrameInputFilenamePattern = "picture-%05d.%s"
     # Try first with standard scan filename template
-    SourceDirFileList_jpg = list(glob(os.path.join(
-        SourceDir,
-        FrameInputFilenamePatternList_jpg)))
+    SourceDirFileList_jpg = list(frame_files(SourceDir, FrameInputFilenamePatternList_jpg))
     if len(SourceDirFileList_jpg) == 0:     # Only try to read if there are no JPG at all
-        SourceDirFileList_png = list(glob(os.path.join(
-            SourceDir,
-            FrameInputFilenamePatternList_png)))
-        SourceDirFileList = sorted(SourceDirFileList_png)
+        SourceDirFileList_png = list(frame_files(SourceDir, FrameInputFilenamePatternList_png))
+        SourceDirFileList = SourceDirFileList_png
         file_type_out = 'png'  # If we have png files in the input, we default to png for the output
     else:
-        SourceDirFileList = sorted(SourceDirFileList_jpg)
+        SourceDirFileList = SourceDirFileList_jpg
         file_type_out = 'jpg'
 
-    SourceDirHdrFileList_jpg = list(glob(os.path.join(
-        SourceDir,
-        HdrInputFilenamePatternList_jpg)))
-    SourceDirHdrFileList_png = list(glob(os.path.join(
-        SourceDir,
-        HdrInputFilenamePatternList_png)))
-    SourceDirHdrFileList = sorted(SourceDirHdrFileList_jpg + SourceDirHdrFileList_png)
+    SourceDirHdrFileList_jpg = list(frame_files(SourceDir, HdrInputFilenamePatternList_jpg))
+    SourceDirHdrFileList_png = list(frame_files(SourceDir, HdrInputFilenamePatternList_png))
+    SourceDirHdrFileList = sorted(SourceDirHdrFileList_jpg + SourceDirHdrFileList_png, key=get_frame_number_from_filename)
     if len(SourceDirHdrFileList_png) != 0:
         file_type_out = 'png'   # If we have png files in the input, we default to png for the output
     elif len(SourceDirHdrFileList_jpg) != 0:
         file_type_out = 'jpg'
 
-    SourceDirLegacyHdrFileList_jpg = list(glob(os.path.join(
-        SourceDir,
-        LegacyHdrInputFilenamePatternList_jpg)))
-    SourceDirLegacyHdrFileList_png = list(glob(os.path.join(
-        SourceDir,
-        LegacyHdrInputFilenamePatternList_png)))
-    SourceDirLegacyHdrFileList = sorted(SourceDirLegacyHdrFileList_jpg + SourceDirLegacyHdrFileList_png)
+    SourceDirLegacyHdrFileList_jpg = list(frame_files(SourceDir, LegacyHdrInputFilenamePatternList_jpg))
+    SourceDirLegacyHdrFileList_png = list(frame_files(SourceDir, LegacyHdrInputFilenamePatternList_png))
+    SourceDirLegacyHdrFileList = sorted(SourceDirLegacyHdrFileList_jpg + SourceDirLegacyHdrFileList_png, key=get_frame_number_from_filename)
     if len(SourceDirLegacyHdrFileList_png) != 0:
         file_type_out = 'png'   # If we have png files in the input, we default to png for the output
     elif len(SourceDirLegacyHdrFileList_jpg) != 0:
@@ -5005,7 +5002,7 @@ def get_source_dir_file_list():
     # Other scanners export ordinary frames with a frame- prefix.
     if NumFiles == 0 and NumHdrFiles == 0 and NumLegacyHdrFiles == 0:
         for extension in ('jpg', 'png'):
-            frames = sorted(glob(os.path.join(SourceDir, f"frame-?????.{extension}")))
+            frames = frame_files(SourceDir, f"frame-?????.{extension}")
             if frames:
                 SourceDirFileList = frames
                 FrameInputFilenamePattern = "frame-%05d.%s"
@@ -5101,8 +5098,7 @@ def get_target_dir_file_list():
     if not os.path.isdir(TargetDir):
         return
 
-    TargetDirFileList = sorted(list(glob(os.path.join(
-        TargetDir, FrameCheckOutputFilenamePattern % file_type_out))))
+    TargetDirFileList = sorted(list(frame_files(TargetDir, FrameCheckOutputFilenamePattern % file_type_out)))
     if len(TargetDirFileList) != 0:
         # read image
         img = cv2.imread(TargetDirFileList[0], cv2.IMREAD_UNCHANGED)
@@ -5120,8 +5116,7 @@ def valid_generated_frame_range():
     file_count = 0
     for i in range(first_absolute_frame + StartFrame,
                    first_absolute_frame + StartFrame + frames_to_encode):
-        file_to_check = os.path.join(TargetDir,
-                                     FrameOutputFilenamePattern % (i, file_type_out))
+        file_to_check = frame_path(TargetDir, FrameOutputFilenamePattern % (i, file_type_out))
         if file_to_check in TargetDirFileList:
             file_count += 1
         else:
@@ -5175,12 +5170,9 @@ Core top level functions
 """
 
 def get_frame_number_from_filename(filename):
-    numbers = re.findall(r'\d\d\d\d\d', filename)
-
-    if len(numbers) >= 1:
-        return int(numbers[-1])
-    else:
-        # Return a default value or handle the case where no numbers are found
+    try:
+        return frame_number(filename)
+    except ValueError:
         return None
 
 
@@ -5391,14 +5383,14 @@ def frame_encode(frame_idx, id, do_save = True, offset_x = 0, offset_y = 0):
     # Get current file(s)
     if HdrFilesOnly:    # Legacy HDR (before 2 Dec 2023): Dedicated filename
         images_to_merge.clear()
-        file1 = os.path.join(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 1, file_type))
+        file1 = frame_path(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 1, file_type))
         img_ref = cv2.imread(file1, cv2.IMREAD_UNCHANGED)   # Keep first frame of the set for stabilization reference
         images_to_merge.append(img_ref)
-        file2 = os.path.join(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 2, file_type))
+        file2 = frame_path(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 2, file_type))
         images_to_merge.append(cv2.imread(file2, cv2.IMREAD_UNCHANGED))
-        file3 = os.path.join(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 3, file_type))
+        file3 = frame_path(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 3, file_type))
         images_to_merge.append(cv2.imread(file3, cv2.IMREAD_UNCHANGED))
-        file4 = os.path.join(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 4, file_type))
+        file4 = frame_path(SourceDir, HdrSetInputFilenamePattern % (frame_idx + first_absolute_frame, 4, file_type))
         images_to_merge.append(cv2.imread(file4, cv2.IMREAD_UNCHANGED))
         AlignMtb.process(images_to_merge, images_to_merge)
         img = MergeMertens.process(images_to_merge)
@@ -5406,28 +5398,28 @@ def frame_encode(frame_idx, id, do_save = True, offset_x = 0, offset_y = 0):
         img = img / img.max() * 255
         img = np.uint8(img)
     else:
-        file1 = os.path.join(SourceDir, FrameInputFilenamePattern % (frame_idx + first_absolute_frame, file_type))
+        file1 = frame_path(SourceDir, FrameInputFilenamePattern % (frame_idx + first_absolute_frame, file_type))
         if not os.path.isfile(file1):
             file_type = 'png' if file_type == 'jpg' else 'jpg'  # Try with the other file type
-            file1 = os.path.join(SourceDir, FrameInputFilenamePattern % (frame_idx + first_absolute_frame, file_type))
+            file1 = frame_path(SourceDir, FrameInputFilenamePattern % (frame_idx + first_absolute_frame, file_type))
         # read image
         img = cv2.imread(file1, cv2.IMREAD_UNCHANGED)
         img_ref = img   # Reference image is the same image for standard capture
         # Check if HDR frames exist. Can handle between 2 and 5
-        file2 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 2, file_type))
+        file2 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 2, file_type))
         if os.path.isfile(file2):   # If hdr frames exist, add them
             images_to_merge.clear()
             images_to_merge.append(img_ref)     # Add first frame
             img_ref_aux = img_ref
             img_ref = cv2.imread(file2, cv2.IMREAD_UNCHANGED) # Override stabilization reference with HDR#2
             images_to_merge.append(img_ref)
-            file3 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 3, file_type))
+            file3 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 3, file_type))
             if os.path.isfile(file3):  # If hdr frames exist, add them
                 images_to_merge.append(cv2.imread(file3, cv2.IMREAD_UNCHANGED))
-                file4 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 4, file_type))
+                file4 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 4, file_type))
                 if os.path.isfile(file4):  # If hdr frames exist, add them
                     images_to_merge.append(cv2.imread(file4, cv2.IMREAD_UNCHANGED))
-                    file5 = os.path.join(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 5, file_type))
+                    file5 = frame_path(SourceDir, FrameHdrInputFilenamePattern % (frame_idx + first_absolute_frame, 5, file_type))
                     if os.path.isfile(file5):  # If hdr frames exist, add them
                         images_to_merge.append(cv2.imread(file5, cv2.IMREAD_UNCHANGED))
 
@@ -5479,7 +5471,7 @@ def frame_encode(frame_idx, id, do_save = True, offset_x = 0, offset_y = 0):
             frame_idx = StartFrame + frames_to_encode - 1
 
         if do_save and os.path.isdir(TargetDir):
-            target_file = os.path.join(TargetDir, FrameOutputFilenamePattern % (first_absolute_frame + frame_idx, file_type_out))
+            target_file = frame_path(TargetDir, FrameOutputFilenamePattern % (first_absolute_frame + frame_idx, file_type_out), create=True)
             cv2.imwrite(target_file, img)
     if dev_debug_enabled:
         logging.debug(f"Thread {id}, finalized to encode Frame {frame_idx}")
@@ -5549,7 +5541,7 @@ def check_subprocess_event_queue(user_terminated):
                 app_status_label.config(text=status_str, fg='red')
                 #frame_idx = StartFrame + frames_to_encode - 1
             if os.path.isdir(TargetDir):
-                target_file = os.path.join(TargetDir, FrameOutputFilenamePattern % (first_absolute_frame + frame_idx, file_type_out))
+                target_file = frame_path(TargetDir, FrameOutputFilenamePattern % (first_absolute_frame + frame_idx, file_type_out), create=True)
                 cv2.imwrite(target_file, img)
             if not user_terminated:    # Display image
                 if frame_idx >= last_displayed_image:
@@ -5608,8 +5600,7 @@ def frame_generation_loop():
         last_displayed_image = 0
         win.update()
         # Refresh Target dir file list
-        TargetDirFileList = sorted(list(glob(os.path.join(
-            TargetDir, FrameCheckOutputFilenamePattern % file_type_out))))
+        TargetDirFileList = sorted(list(frame_files(TargetDir, FrameCheckOutputFilenamePattern % file_type_out)))
         if GenerateCsv:
             name, ext = os.path.splitext(CsvPathName)
             name = f"{name} ({frames_to_encode} frames, {CsvFramesOffPercent:.1f}% KO, Avg match level {average_quality}).csv"
@@ -5733,6 +5724,36 @@ def draw_multiple_line_text(image, text, font, text_color, num_lines):
     draw.rectangle([int(image_width*0.05), int(image_height*0.05), int(image_width*0.95), int(image_height*0.95)], fill=None, outline='white', width=20)
 
 
+def get_video_frame_indices(start_frame, frame_count, bad_frames, skip_misaligned):
+    excluded = {frame['frame_idx'] for frame in bad_frames} if skip_misaligned else set()
+    return [index for index in range(start_frame, start_frame + frame_count)
+            if index not in excluded]
+
+
+def get_available_video_frames(frame_indices):
+    """Keep existing output images, preserving their source-relative numbering."""
+    available = []
+    for index in frame_indices:
+        filename = frame_path(TargetDir, FrameOutputFilenamePattern %
+                                (index + first_absolute_frame, file_type_out))
+        if os.path.isfile(filename):
+            available.append(index)
+        else:
+            logging.warning("Skipping missing video frame: %s", filename)
+    return available
+
+
+def write_video_frame_manifest(manifest):
+    """List retained images explicitly so FFmpeg can read past numbering gaps."""
+    manifest.write('ffconcat version 1.0\n')
+    for index in video_frame_indices:
+        filename = os.path.abspath(frame_path(TargetDir, FrameOutputFilenamePattern %
+                                              (index + first_absolute_frame, file_type_out)))
+        # FFmpeg's concat parser uses single quotes and backslash escaping.
+        filename = filename.replace("'", "'\\''")
+        manifest.write(f"file '{filename}'\noption framerate {VideoFps}\n")
+
+
 def video_create_title():
     global video_title_str
     global VideoFps
@@ -5743,19 +5764,21 @@ def video_create_title():
         title_duration = round(len(video_title_str.get())*50/1000) # 50 ms per char
         title_duration = min(title_duration, 10)    # no more than 10 sec
         title_duration = max(title_duration, 3)    # no less than 3 sec
-        title_num_frames = min(title_duration * VideoFps, frames_to_encode-1)
+        title_num_frames = min(title_duration * VideoFps, len(video_frame_indices))
         # Custom font style and font size
-        img = Image.open(os.path.join(TargetDir, FrameOutputFilenamePattern % (StartFrame + first_absolute_frame, file_type_out)))
+        img = Image.open(frame_path(TargetDir, FrameOutputFilenamePattern % (video_frame_indices[0] + first_absolute_frame, file_type_out)))
         myFont, num_lines = get_adjusted_font(img, video_title_str.get())
+        img.close()
         if myFont == 0:
+            title_num_frames = 0
             return
         title_frame_idx = StartFrame + first_absolute_frame
-        title_first_frame = random.randint(StartFrame + first_absolute_frame, StartFrame + first_absolute_frame + frames_to_encode - title_num_frames - 1)
-        for i in range (title_first_frame, title_first_frame + title_num_frames):
+        title_first_frame = random.randint(0, len(video_frame_indices) - (title_num_frames + 1) // 2)
+        for i in range(title_first_frame, title_first_frame + title_num_frames):
             status_str = "Status: Generating title %.1f%%" % (((i - title_first_frame) * 100 / title_num_frames))
             app_status_label.config(text=status_str, fg='black')
             # Open an Image
-            img = Image.open(os.path.join(TargetDir, FrameOutputFilenamePattern % ((int(i/2)+1)*2, file_type_out)))
+            img = Image.open(frame_path(TargetDir, FrameOutputFilenamePattern % (video_frame_indices[title_first_frame + (i - title_first_frame) // 2] + first_absolute_frame, file_type_out)))
 
             # Call draw Method to add 2D graphics in an image
             #I1 = ImageDraw.Draw(img)
@@ -5824,11 +5847,8 @@ def call_ffmpeg():
                            '-framerate', str(VideoFps),
                            '-start_number', str(StartFrame + first_absolute_frame),
                            '-i', os.path.join(TargetDir, pattern)])
-    pattern = FrameOutputFilenamePattern_for_ffmpeg + file_type_out
-    cmd_ffmpeg.extend(['-f', 'image2',
-                       '-framerate', str(VideoFps),
-                       '-start_number', str(StartFrame + first_absolute_frame),
-                       '-i', os.path.join(TargetDir, pattern)])
+    input_manifest = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.ffconcat', delete=False)
+    cmd_ffmpeg.extend(['-f', 'concat', '-safe', '0', '-i', input_manifest.name])
     # Add soundtrack if enabled
     if enable_soundtrack:
         cmd_ffmpeg.extend(['-stream_loop', '-1', '-i', soundtrack_file_path])
@@ -5836,7 +5856,7 @@ def call_ffmpeg():
     filter_complex_options=''
     # Title sequence
     if title_num_frames > 0:   # There is a title
-        filter_complex_options+='[0:v]'
+        filter_complex_options += f'[0:v]trim=end_frame={title_num_frames},setpts=PTS-STARTPTS,'
         if (out_frame_width != 0 and out_frame_height != 0):
             filter_complex_options+='scale=w='+video_width+':h='+video_height+':'
         filter_complex_options+='force_original_aspect_ratio=decrease,pad='+video_width+':'+video_height+':(ow-iw)/2:(oh-ih)/2,setsar=1'
@@ -5846,12 +5866,12 @@ def call_ffmpeg():
     # Main video
     # trim filter: Problems with some specific number of frames, which cause video encoding to extend till the end
     # Initially thought it happen with prime number, later verified it can be any number
-    frames_to_encode_trim = frames_to_encode
+    frames_to_encode_trim = len(video_frame_indices)
     if title_num_frames > 0:   # There is a title
         filter_complex_options+='[1:v]'
     else:
         filter_complex_options += '[0:v]'
-    filter_complex_options+='trim=start_frame=0:end_frame='+str(frames_to_encode_trim)+',setpts=PTS-STARTPTS[v1];'  # Limit number of frames of main video
+    filter_complex_options += f'trim=end_frame={frames_to_encode_trim},setpts=N/({VideoFps}*TB)[v1];'
     filter_complex_options+='[v1]'
     if (out_frame_width != 0 and out_frame_height != 0):
         filter_complex_options+='scale=w='+video_width+':h='+video_height+':'
@@ -5863,33 +5883,47 @@ def call_ffmpeg():
     if title_num_frames > 0:   # There is a title
         filter_complex_options += '[v0]'
     filter_complex_options+='[v2]concat=n='+str(2 if title_num_frames>0 else 1)+':v=1[v]'
-    cmd_ffmpeg.extend(['-filter_complex', filter_complex_options])
+    # A script avoids command-line length limits for long reels with many exclusions.
+    filter_script = tempfile.NamedTemporaryFile(mode='w', suffix='.ffmpeg', delete=False)
+    try:
+        with input_manifest:
+            write_video_frame_manifest(input_manifest)
+        with filter_script:
+            filter_script.write(filter_complex_options)
+        ffmpeg_help = sp.run([FfmpegBinName, '-h', 'full'], capture_output=True, text=True).stdout
+        filter_option = '-filter_complex_script' if '-filter_complex_script' in ffmpeg_help else '-/filter_complex'
+        cmd_ffmpeg.extend([filter_option, filter_script.name])
 
-    if not enable_soundtrack:
-        cmd_ffmpeg.extend(['-an'])  # no audio
-    cmd_ffmpeg.extend(
-        ['-vcodec', 'libx264',
-         '-preset', ffmpeg_preset.get(),
-         '-crf', '18',
-         '-pix_fmt', 'yuv420p',
-         '-map', '[v]'])
-    if enable_soundtrack:
-        if title_num_frames > 0:   # There is a title
-            cmd_ffmpeg.extend(['-map', '2:a'])
-        else:
-            cmd_ffmpeg.extend(['-map', '1:a'])
-    cmd_ffmpeg.extend(
-         ['-frames:v', str(title_num_frames + frames_to_encode_trim),
-         os.path.join(video_target_dir_str.get(),
-                      TargetVideoFilename)])
+        if not enable_soundtrack:
+            cmd_ffmpeg.extend(['-an'])  # no audio
+        cmd_ffmpeg.extend(
+            ['-vcodec', 'libx264',
+             '-preset', ffmpeg_preset.get(),
+             '-crf', '18',
+             '-pix_fmt', 'yuv420p',
+             '-map', '[v]'])
+        if enable_soundtrack:
+            if title_num_frames > 0:   # There is a title
+                cmd_ffmpeg.extend(['-map', '2:a'])
+            else:
+                cmd_ffmpeg.extend(['-map', '1:a'])
+        cmd_ffmpeg.extend(
+             ['-frames:v', str(title_num_frames + frames_to_encode_trim),
+             os.path.join(video_target_dir_str.get(),
+                          TargetVideoFilename)])
 
-    logging.debug("Generated ffmpeg command: %s", cmd_ffmpeg)
-    logging.debug("Generated ffmpeg command (command line): %s", convert_ffmpeg_list_to_command_line(cmd_ffmpeg))
-    ffmpeg_process = sp.Popen(cmd_ffmpeg, stderr=sp.STDOUT,
-                              stdout=sp.PIPE,
-                              universal_newlines=True)
-    ffmpeg_success = ffmpeg_process.wait() == 0
-    ffmpeg_encoding_status = ffmpeg_state.Completed
+        logging.debug("Generated ffmpeg command: %s", cmd_ffmpeg)
+        logging.debug("Generated ffmpeg command (command line): %s", convert_ffmpeg_list_to_command_line(cmd_ffmpeg))
+        ffmpeg_process = sp.Popen(cmd_ffmpeg, stderr=sp.STDOUT,
+                                  stdout=sp.PIPE, universal_newlines=True)
+        ffmpeg_success = ffmpeg_process.wait() == 0
+    except OSError:
+        logging.exception("Could not start FFmpeg")
+        ffmpeg_success = False
+    finally:
+        os.remove(filter_script.name)
+        os.remove(input_manifest.name)
+        ffmpeg_encoding_status = ffmpeg_state.Completed
 
 def play_video():
     TargetVideoFilename = video_filename_str.get()
@@ -5952,32 +5986,27 @@ def video_generation_loop():
     global frame_selected, last_displayed_image
     global frame_slider
 
+    global video_frame_indices
+
     if ffmpeg_encoding_status == ffmpeg_state.Pending:
+        video_frame_indices = get_video_frame_indices(
+            StartFrame, frames_to_encode, bad_frame_list, skip_misaligned_frames.get())
+        misaligned_count = frames_to_encode - len(video_frame_indices)
+        candidate_count = len(video_frame_indices)
+        video_frame_indices = get_available_video_frames(video_frame_indices)
+        logging.info("Video includes %s frames; skipping %s registered misaligned frames and %s missing frames",
+                     len(video_frame_indices), misaligned_count, candidate_count - len(video_frame_indices))
         # Check for special cases first
-        if frames_to_encode == 0:
+        if not video_frame_indices:
             status_str = "Status: No frames to encode"
             app_status_label.config(text=status_str, fg='red')
             if not BatchJobRunning:
                 tk.messagebox.showwarning(
                     "No frames match range to generate video",
                     "Video cannot be generated.\r\n"
-                    "No frames in target folder match the specified range.\r\n"
+                    "No frames remain in the specified range after applying video exclusions.\r\n"
                     "Please review your settings and try again.")
             logging.error(f"Cannot generate video {TargetVideoFilename}, no frames to encode")
-            generation_exit(success = False)  # Restore all settings to normal
-        elif not valid_generated_frame_range():
-            status_str = "Status: No frames to encode"
-            app_status_label.config(text=status_str, fg='red')
-            logging.error(f"Cannot generate video {TargetVideoFilename}, due to some frames missing in range "
-                          f"{StartFrame+first_absolute_frame}, {StartFrame+first_absolute_frame+frames_to_encode}")
-            if not BatchJobRunning:
-                tk.messagebox.showerror(
-                    "Frames missing",
-                    "Video cannot be generated.\r\n"
-                    f"Not all frames in specified range ({StartFrame+first_absolute_frame}, {StartFrame+first_absolute_frame+frames_to_encode}) exist in target folder to "
-                    "allow video generation.\r\n"
-                    "Please regenerate frames making sure option "
-                    "\'Skip Frame regeneration\' is not selected, and try again.")
             generation_exit(success = False)  # Restore all settings to normal
         else:
             get_target_dir_file_list()  # Refresh target dir file list here as well for batch mode encoding
@@ -5988,9 +6017,9 @@ def video_generation_loop():
             ffmpeg_success = False
             ffmpeg_encoding_thread = threading.Thread(target=call_ffmpeg)
             ffmpeg_encoding_thread.daemon = True
+            ffmpeg_encoding_status = ffmpeg_state.Running
             ffmpeg_encoding_thread.start()
             win.update()
-            ffmpeg_encoding_status = ffmpeg_state.Running
             win.after(200, video_generation_loop)
     elif ffmpeg_encoding_status == ffmpeg_state.Running:
         if ConvertLoopExitRequested:
@@ -6012,12 +6041,14 @@ def video_generation_loop():
                 frame_str = str(line)[:-1].replace('=', ' ').split()[1]
                 if is_a_number(frame_str):  # Sometimes ffmpeg output might be corrupted on the way
                     encoded_frame = int(frame_str)
-                    frame_selected.set(StartFrame + first_absolute_frame + encoded_frame)
-                    frame_slider.set(StartFrame + first_absolute_frame + encoded_frame)
-                    refresh_current_frame_ui_info(encoded_frame, first_absolute_frame)
-                    status_str = f"Status: Generating video {encoded_frame*100/(frames_to_encode+title_num_frames):.1f}%"
+                    video_index = max(0, min(encoded_frame - title_num_frames - 1, len(video_frame_indices) - 1))
+                    source_index = video_frame_indices[video_index]
+                    frame_selected.set(source_index + first_absolute_frame)
+                    frame_slider.set(source_index + first_absolute_frame)
+                    refresh_current_frame_ui_info(source_index, first_absolute_frame)
+                    status_str = f"Status: Generating video {encoded_frame*100/(len(video_frame_indices)+title_num_frames):.1f}%"
                     app_status_label.config(text=status_str, fg='black')
-                    display_output_frame_by_number(encoded_frame)
+                    display_output_frame_by_number(source_index + first_absolute_frame - StartFrame)
                 else:
                     app_status_label.config(text='Error, ffmpeg sync lost', fg='red')
                     logging.error("Error, ffmpeg sync lost. Line parsed: %s", line)
@@ -6292,6 +6323,7 @@ def build_ui():
     global perform_sharpness, perform_sharpness_checkbox
     global perform_gamma_correction_checkbox, gamma_correction_spinbox
     global generate_video, generate_video_checkbox
+    global skip_misaligned_frames, skip_misaligned_frames_cb
     global encode_all_frames, encode_all_frames_checkbox
     global frames_to_encode_str, frames_to_encode, frames_to_encode_label
     global save_bg, save_fg
@@ -6818,6 +6850,18 @@ def build_ui():
                                       else DISABLED)
     as_tooltips.add(skip_frame_regeneration_cb, "If frames have ben already generated in a previous run, and you want to only generate the vieo, check this one")
 
+    video_row += 1
+
+    skip_misaligned_frames = tk.BooleanVar(value=False)
+    skip_misaligned_frames_cb = tk.Checkbutton(
+        video_frame, text='Skip misaligned frames',
+        variable=skip_misaligned_frames, onvalue=True, offvalue=False,
+        font=("Arial", FontSize))
+    skip_misaligned_frames_cb.grid(row=video_row, column=0, columnspan=3, sticky=W, padx=5)
+    skip_misaligned_frames_cb.config(state=DISABLED)
+    as_tooltips.add(skip_misaligned_frames_cb,
+                    "Exclude all frames in the misaligned frame list, including manually corrected frames, "
+                    "from the video and title. The remaining frames play at the selected FPS, shortening the video.")
     video_row += 1
 
     # Video target folder
